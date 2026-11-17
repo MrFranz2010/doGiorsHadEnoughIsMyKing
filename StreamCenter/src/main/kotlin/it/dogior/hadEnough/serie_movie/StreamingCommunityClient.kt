@@ -3,6 +3,7 @@ package it.dogior.hadEnough.serie_movie
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.app
+import it.dogior.hadEnough.StreamCenterPlugin
 import it.dogior.hadEnough.model.StreamCenterMetadata
 import it.dogior.hadEnough.model.StreamingCommunityEpisode
 import it.dogior.hadEnough.model.StreamingCommunityEpisodeDetails
@@ -23,6 +24,8 @@ import org.json.JSONObject
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+
+internal const val STREAMING_COMMUNITY_SESSION_PREF = "streamcenter_sc_session"
 
 internal class StreamingCommunityClient(
     private val sharedPref: SharedPreferences?,
@@ -278,7 +281,7 @@ internal class StreamingCommunityClient(
     }
 
     fun resetSession() {
-        sharedPref?.edit()?.remove(PREF_SESSION)?.apply()
+        sharedPref?.edit()?.remove(STREAMING_COMMUNITY_SESSION_PREF)?.apply()
         lastForcedRefreshMs = 0L
         applySession(cookie = "", xsrfToken = "", inertiaVersion = "")
         log("Sessione provider reimpostata")
@@ -540,22 +543,23 @@ internal class StreamingCommunityClient(
     }
 
     private fun persistSession() {
+        if (StreamCenterPlugin.completeResetInProgress) return
         if (!hasSessionHeaders()) return
         val payload = JSONObject()
             .put("cookie", sessionHeaders["Cookie"].orEmpty())
             .put("xsrfToken", xsrfToken)
             .put("inertiaVersion", inertiaVersion)
             .put("expiresAt", System.currentTimeMillis() + SESSION_TTL_MS)
-        sharedPref?.edit()?.putString(PREF_SESSION, payload.toString())?.apply()
+        sharedPref?.edit()?.putString(STREAMING_COMMUNITY_SESSION_PREF, payload.toString())?.apply()
     }
 
     private fun readSessionPayload(): JSONObject? {
-        val raw = sharedPref?.getString(PREF_SESSION, null) ?: return null
+        val raw = sharedPref?.getString(STREAMING_COMMUNITY_SESSION_PREF, null) ?: return null
         return runCatching {
             val json = JSONObject(raw)
             val expiresAt = json.optLong("expiresAt", 0L)
             if (expiresAt in 1..System.currentTimeMillis()) {
-                sharedPref?.edit()?.remove(PREF_SESSION)?.apply()
+                sharedPref?.edit()?.remove(STREAMING_COMMUNITY_SESSION_PREF)?.apply()
                 return null
             }
             json
@@ -691,7 +695,6 @@ internal class StreamingCommunityClient(
 
     private companion object {
         const val SOURCE_NAME = "StreamingCommunity"
-        const val PREF_SESSION = "streamcenter_sc_session"
         const val SESSION_TTL_MS = 24L * 60L * 60L * 1000L
         const val FORCE_REFRESH_INTERVAL_MS = 60_000L
         const val DETAIL_CANDIDATE_LIMIT = 8

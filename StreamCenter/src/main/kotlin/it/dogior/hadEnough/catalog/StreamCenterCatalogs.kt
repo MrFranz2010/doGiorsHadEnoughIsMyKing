@@ -25,6 +25,7 @@ internal data class StreamCenterCatalogSection(
     val trackingListKey: String? = null,
     val stremioCatalog: StreamCenterStremioCatalogDescriptor? = null,
     val trackingMediaCategory: StreamCenterTrackingMediaCategory = StreamCenterTrackingMediaCategory.ALL,
+    val requiresTmdbApiKey: Boolean = false,
 )
 
 internal data class StreamCenterCatalogDefinition(
@@ -130,8 +131,22 @@ internal object StreamCenterCatalogs {
                     "Film al cinema",
                     "/movie/now-playing",
                     TvType.Movie,
+                    requiresTmdbApiKey = true,
                 ),
-                StreamCenterCatalogSection("movie_upcoming", "Film in arrivo", "/movie/upcoming", TvType.Movie),
+                StreamCenterCatalogSection(
+                    "movie_upcoming",
+                    "Film in arrivo",
+                    "/movie/upcoming",
+                    TvType.Movie,
+                    requiresTmdbApiKey = true,
+                ),
+                StreamCenterCatalogSection(
+                    "movie_new_streaming",
+                    "Film nuovi in streaming",
+                    "/movie?discover_preset=new-on-streaming",
+                    TvType.Movie,
+                    defaultEnabled = false,
+                ),
                 StreamCenterCatalogSection(
                     "movie_top_rated",
                     "Film più votati",
@@ -444,6 +459,16 @@ internal object StreamCenterCatalogs {
             .firstOrNull { addon -> addon.key == addonKey }
     }
 
+    fun stremioCatalogKey(addonKey: String): String = STREMIO_CATALOG_KEY_PREFIX + addonKey
+
+    fun configuredStremioCatalog(
+        sharedPref: SharedPreferences?,
+        addonKey: String,
+    ): StreamCenterCatalogDefinition? {
+        val key = stremioCatalogKey(addonKey)
+        return configuredCatalogs(sharedPref).firstOrNull { it.key == key }
+    }
+
     fun configuredCatalogs(sharedPref: SharedPreferences?): List<StreamCenterCatalogDefinition> {
         val catalogByKey = allCatalogs(sharedPref).associateBy(StreamCenterCatalogDefinition::key)
         return configuredCatalogKeys(sharedPref).mapNotNull(catalogByKey::get)
@@ -544,6 +569,9 @@ internal object StreamCenterCatalogs {
             remove(catalogSectionsKey(catalog.key))
             remove(catalogSectionOrderKey(catalog.key))
         }.apply()
+        StreamCenterHomeImports.read(preferences)
+            .filter { it.kind == StreamCenterHomeImports.CATALOG && it.sourceKey == catalog.key }
+            .forEach { StreamCenterHomeImports.remove(preferences, it.key) }
     }
 
     fun reset(sharedPref: SharedPreferences?) {

@@ -4,7 +4,13 @@ import it.dogior.hadEnough.extensions.InstalledExtensionSources
 
 import it.dogior.hadEnough.catalog.StreamCenterCatalogs
 import it.dogior.hadEnough.catalog.StreamCenterHomeImports
+import it.dogior.hadEnough.catalog.StreamCenterUnairedResume
 import it.dogior.hadEnough.tracking.TrackingIdService
+import it.dogior.hadEnough.tracking.StreamCenterTrackingOverrides
+import it.dogior.hadEnough.localsync.StreamCenterLocalSyncAutoConfig
+import it.dogior.hadEnough.localsync.StreamCenterLocalSyncAutoRunner
+import it.dogior.hadEnough.tmdb.StreamCenterTmdbCredential
+import it.dogior.hadEnough.tmdb.StreamCenterTmdbUserAgent
 import it.dogior.hadEnough.settings.*
 import it.dogior.hadEnough.iptv.StreamCenterIptv
 import it.dogior.hadEnough.stremio.*
@@ -18,6 +24,7 @@ import it.dogior.hadEnough.util.StreamCenterVpnGuard
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.appcompat.app.AppCompatActivity
+import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.syncproviders.SyncIdName
@@ -143,8 +150,17 @@ class StreamCenterPlugin : Plugin() {
         const val PREF_VISUAL_EFFECTS_PUBLIC_IP = "visualEffectsPublicIp"
         const val PREF_REQUIRE_VPN = "requireVpn"
         const val PREF_FORCE_TV_MODE = "forceTvMode"
+        const val PREF_LIBASS_SUBTITLES = "libassSubtitles"
         const val PREF_MEDIA_CACHE_ENABLED = "mediaCacheEnabled"
         const val PREF_HOME_CALENDAR_CACHE_ENABLED = "homeCalendarCacheEnabled"
+        const val PREF_TMDB_SCORE_CACHE_ENABLED = "tmdbScoreCacheEnabled"
+        const val PREF_LAZY_HOME = "lazyHome"
+        const val PREF_LAZY_HOME_WAIT_MS = "lazyHomeWaitMs"
+        const val PREF_LAZY_HOME_PARALLEL_SECTIONS = "lazyHomeParallelSections"
+        const val LAZY_HOME_DEFAULT_WAIT_MS = 1_000
+        const val LAZY_HOME_DEFAULT_PARALLEL_SECTIONS = 6
+        val LAZY_HOME_WAIT_OPTIONS_MS = listOf(500, 1_000, 2_000, 3_000)
+        val LAZY_HOME_PARALLEL_OPTIONS = listOf(3, 6, 9)
         const val PREF_MEDIA_CACHE_MAX_ENTRIES = "mediaCacheMaxEntries"
         const val PREF_MEDIA_CACHE_MAX_MB = "mediaCacheMaxMb"
         const val PREF_MEDIA_CACHE_COMPLETED_DAYS = "mediaCacheCompletedDays"
@@ -191,10 +207,10 @@ class StreamCenterPlugin : Plugin() {
         const val PREF_URL_VIXSRC = "urlVixSrc"
         const val PREF_URL_VIDXGO = "urlVidxGo"
 
-        const val DEFAULT_URL_ANIMEUNITY = "https://www.animeunity.so"
+        const val DEFAULT_URL_ANIMEUNITY = "https://www.animeunity.to"
         const val DEFAULT_URL_ANIMEWORLD = "https://www.animeworld.ac"
         const val DEFAULT_URL_ANIMESATURN = "https://www.animesaturn.net"
-        const val DEFAULT_URL_STREAMINGCOMMUNITY = "https://streamingcommunityz.photography"
+        const val DEFAULT_URL_STREAMINGCOMMUNITY = "https://streamingcommunityz.boo"
         const val DEFAULT_URL_VIXCLOUD = "https://vixcloud.co"
         const val DEFAULT_URL_VIXSRC = "https://vixsrc.to"
         const val DEFAULT_URL_VIDXGO = "https://v.vidxgo.co"
@@ -205,6 +221,8 @@ class StreamCenterPlugin : Plugin() {
 
         const val PREF_AUTO_UPDATE_SOURCE_URLS = "autoUpdateSourceUrls"
         const val PREF_TMDB_SEARCH_FALLBACK = "tmdbSearchFallback"
+        const val PREF_ONE_TAP_PLAYBACK = "oneTapPlayback"
+        const val PREF_REMOTE_CONTROL = "remoteControl"
 
         const val PREF_ANILIST_RPM = "anilistRequestsPerMinute"
         const val DEFAULT_ANILIST_RPM = 30
@@ -372,6 +390,7 @@ class StreamCenterPlugin : Plugin() {
 
         internal var activeSharedPref: SharedPreferences? = null
         internal var activeContext: Context? = null
+        @Volatile internal var completeResetInProgress = false
         private var activePlugin: StreamCenterPlugin? = null
 
         internal fun refreshCatalogs() {
@@ -387,11 +406,17 @@ class StreamCenterPlugin : Plugin() {
                 ?: context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val failures = listOfNotNull(
                 runCatching {
-                    check(preferences.edit().clear().commit()) {
+                    val editor = preferences.edit()
+                    preferences.all.keys.filterNot(::isPreservedOnReset).forEach(editor::remove)
+                    check(editor.commit()) {
                         "Impossibile cancellare la configurazione principale."
                     }
                 }.exceptionOrNull(),
                 runCatching { StreamCenterBackupManager.resetDirectory(context) }.exceptionOrNull(),
+                runCatching { StreamCenterLocalSyncAutoConfig.reset(context) }.exceptionOrNull(),
+                runCatching { StreamCenterLocalSyncAutoRunner.refresh() }.exceptionOrNull(),
+                runCatching { it.dogior.hadEnough.remote.StreamCenterRemoteQueue.clear(context) }.exceptionOrNull(),
+                runCatching { it.dogior.hadEnough.remote.StreamCenterRemote.refresh() }.exceptionOrNull(),
                 runCatching { StreamCenter.resetRuntimeConfiguration() }.exceptionOrNull(),
                 runCatching { StreamCenterIptv.setCustomPlaylists(emptyList()) }.exceptionOrNull(),
                 runCatching { StreamCenterStremioManifestRefreshNotice.reset() }.exceptionOrNull(),
@@ -403,6 +428,19 @@ class StreamCenterPlugin : Plugin() {
                 )
             }
         }
+
+        private val PRESERVED_ON_RESET = setOf(
+            StreamCenterTrackingOverrides.PREF_OVERRIDES,
+            PREF_MEDIA_CACHE_ENABLED,
+            PREF_HOME_CALENDAR_CACHE_ENABLED,
+            PREF_TMDB_SCORE_CACHE_ENABLED,
+            PREF_MEDIA_CACHE_MAX_ENTRIES,
+            PREF_MEDIA_CACHE_MAX_MB,
+            PREF_MEDIA_CACHE_COMPLETED_DAYS,
+        )
+
+        private fun isPreservedOnReset(key: String): Boolean =
+            key in PRESERVED_ON_RESET || StreamCenterTmdbCredential.isDeviceOnly(key)
 
         fun shouldShowHomeScore(sharedPref: SharedPreferences?): Boolean {
             return sharedPref?.getBoolean(PREF_SHOW_HOME_SCORE, true) ?: true
@@ -483,6 +521,21 @@ class StreamCenterPlugin : Plugin() {
         fun isHomeCalendarCacheEnabled(sharedPref: SharedPreferences?): Boolean =
             sharedPref?.getBoolean(PREF_HOME_CALENDAR_CACHE_ENABLED, false) ?: false
 
+        fun isTmdbScoreCacheEnabled(sharedPref: SharedPreferences?): Boolean =
+            sharedPref?.getBoolean(PREF_TMDB_SCORE_CACHE_ENABLED, true) ?: true
+
+        fun isLazyHomeEnabled(sharedPref: SharedPreferences?): Boolean =
+            sharedPref?.getBoolean(PREF_LAZY_HOME, true) ?: true
+
+        fun lazyHomeWaitMs(sharedPref: SharedPreferences?): Int =
+            (sharedPref?.getInt(PREF_LAZY_HOME_WAIT_MS, LAZY_HOME_DEFAULT_WAIT_MS) ?: LAZY_HOME_DEFAULT_WAIT_MS)
+                .takeIf { it in LAZY_HOME_WAIT_OPTIONS_MS } ?: LAZY_HOME_DEFAULT_WAIT_MS
+
+        fun lazyHomeParallelSections(sharedPref: SharedPreferences?): Int =
+            (sharedPref?.getInt(PREF_LAZY_HOME_PARALLEL_SECTIONS, LAZY_HOME_DEFAULT_PARALLEL_SECTIONS)
+                ?: LAZY_HOME_DEFAULT_PARALLEL_SECTIONS)
+                .takeIf { it in LAZY_HOME_PARALLEL_OPTIONS } ?: LAZY_HOME_DEFAULT_PARALLEL_SECTIONS
+
         fun mediaCacheMaxEntries(sharedPref: SharedPreferences?): Int =
             (sharedPref?.getInt(PREF_MEDIA_CACHE_MAX_ENTRIES, MEDIA_CACHE_DEFAULT_MAX_ENTRIES)
                 ?: MEDIA_CACHE_DEFAULT_MAX_ENTRIES).coerceIn(10, 5000)
@@ -493,7 +546,11 @@ class StreamCenterPlugin : Plugin() {
 
         fun mediaCacheCompletedDays(sharedPref: SharedPreferences?): Int =
             (sharedPref?.getInt(PREF_MEDIA_CACHE_COMPLETED_DAYS, MEDIA_CACHE_DEFAULT_COMPLETED_DAYS)
-                ?: MEDIA_CACHE_DEFAULT_COMPLETED_DAYS).coerceIn(1, 365)
+                ?: MEDIA_CACHE_DEFAULT_COMPLETED_DAYS).coerceIn(1, StreamCenterMediaCache.MAX_RETENTION_DAYS)
+
+        fun isLibassSubtitlesEnabled(sharedPref: SharedPreferences?): Boolean {
+            return sharedPref?.getBoolean(PREF_LIBASS_SUBTITLES, true) ?: true
+        }
 
         fun isForceTvModeEnabled(sharedPref: SharedPreferences?): Boolean {
             return sharedPref?.getBoolean(PREF_FORCE_TV_MODE, false) ?: false
@@ -755,6 +812,9 @@ class StreamCenterPlugin : Plugin() {
                 remove(PREF_STREMIO_ADDONS)
                 remove(PREF_AUTO_UPDATE_SOURCE_URLS)
                 remove(PREF_TMDB_SEARCH_FALLBACK)
+                remove(PREF_ONE_TAP_PLAYBACK)
+                remove(PREF_REMOTE_CONTROL)
+                remove(StreamCenterTmdbUserAgent.PREF_KEY)
                 stremioEnabledKeys.forEach { key -> remove(key) }
             }.apply()
         }
@@ -845,6 +905,12 @@ class StreamCenterPlugin : Plugin() {
         fun isSourceUrlAutoUpdateEnabled(sharedPref: SharedPreferences?): Boolean {
             return sharedPref?.getBoolean(PREF_AUTO_UPDATE_SOURCE_URLS, true) ?: true
         }
+
+        fun isOneTapPlaybackEnabled(sharedPref: SharedPreferences?): Boolean =
+            sharedPref?.getBoolean(PREF_ONE_TAP_PLAYBACK, false) ?: false
+
+        fun isRemoteControlEnabled(sharedPref: SharedPreferences?): Boolean =
+            sharedPref?.getBoolean(PREF_REMOTE_CONTROL, false) ?: false
 
         fun isTmdbSearchFallbackEnabled(sharedPref: SharedPreferences?): Boolean =
             sharedPref?.getBoolean(PREF_TMDB_SEARCH_FALLBACK, true) ?: true
@@ -1002,17 +1068,17 @@ class StreamCenterPlugin : Plugin() {
                 }
         }
 
-        fun getBuildInfoText(): String {
-            val rawCommit = BuildConfig.BUILD_COMMIT_SHA.trim()
-            val rawBuildCompletedAt = BuildConfig.BUILD_COMPLETED_AT_ROME.trim()
-            val shortCommit = rawCommit.takeIf { it.isNotEmpty() && it != "unknown" }?.take(7)
-            val buildCompletedAt = rawBuildCompletedAt.replace(' ', ' ')
-            return when {
-                shortCommit != null && buildCompletedAt.isNotEmpty() ->
-                    "Commit $shortCommit\nBuild $buildCompletedAt"
-                shortCommit != null -> "Commit $shortCommit"
-                else -> "???"
-            }
+        fun getBuildInfo(): List<Pair<String, String>> {
+            val commit = BuildConfig.BUILD_COMMIT_SHA.trim().takeIf { it.isNotEmpty() && it != "unknown" }?.take(7)
+            val completedAt = BuildConfig.BUILD_COMPLETED_AT_ROME.replace('\u00A0', ' ').trim()
+            val build = Regex("""^(\d{2}/\d{2})/\d{4} (\d{2}:\d{2})""").find(completedAt)
+                ?.let { "${it.groupValues[1]} ${it.groupValues[2]}" }
+                ?: completedAt.takeIf(String::isNotEmpty)
+            return listOfNotNull(
+                "Versione" to BuildConfig.PLUGIN_VERSION,
+                commit?.let { "Commit" to it },
+                build?.let { "Build" to it },
+            )
         }
 
         fun sectionEnabledKey(sectionKey: String): String = "home_${sectionKey}_enabled"
@@ -1961,6 +2027,17 @@ class StreamCenterPlugin : Plugin() {
 
         internal fun resetHomeConfiguration(sharedPref: SharedPreferences?) {
             val preferences = sharedPref ?: return
+            resetHomeSectionsConfiguration(preferences)
+            preferences.edit().apply {
+                preferences.all.keys.filter { it.startsWith("home_category_") }.forEach { remove(it) }
+                remove(PREF_HOME_CATEGORY_ORDER)
+                remove(PREF_IPTV_REGION)
+            }.apply()
+            clearIptvCustomPlaylists(preferences)
+        }
+
+        internal fun resetHomeSectionsConfiguration(sharedPref: SharedPreferences?) {
+            val preferences = sharedPref ?: return
             val sectionPreferencePrefixes = listOf(
                 "home_",
                 "iptvSectionChannels_",
@@ -1971,15 +2048,14 @@ class StreamCenterPlugin : Plugin() {
                 "movieCustomFilters_",
             )
             val sectionPreferenceKeys = preferences.all.keys.filter { key ->
-                sectionPreferencePrefixes.any { prefix -> key.startsWith(prefix) }
+                !key.startsWith("home_category_") &&
+                    sectionPreferencePrefixes.any { prefix -> key.startsWith(prefix) }
             }
             preferences.edit().apply {
                 sectionPreferenceKeys.forEach { key -> remove(key) }
                 remove(PREF_HOME_ORDER)
                 remove(PREF_HOME_FREE_ORDER)
                 remove(StreamCenterHomeImports.PREF_SECTIONS)
-                remove(PREF_HOME_CATEGORY_ORDER)
-                remove(PREF_IPTV_REGION)
                 remove(PREF_IPTV_CUSTOM_SECTIONS)
                 remove(PREF_IPTV_CUSTOM_SECTION_COUNTER)
                 remove(PREF_ANIME_CUSTOM_SECTIONS)
@@ -1991,7 +2067,6 @@ class StreamCenterPlugin : Plugin() {
                 remove(PREF_TRACKING_CUSTOM_SECTIONS)
                 remove(PREF_TRACKING_CUSTOM_SECTION_COUNTER)
             }.apply()
-            clearIptvCustomPlaylists(preferences)
         }
 
         fun getIptvRegion(sharedPref: SharedPreferences?): String {
@@ -2024,23 +2099,54 @@ class StreamCenterPlugin : Plugin() {
     }
 
     private var sharedPref: SharedPreferences? = null
-    private val registeredCatalogKeys = mutableSetOf<String>()
+    private val registeredCatalogs = mutableMapOf<String, StreamCenter>()
 
     private fun registerConfiguredCatalogs() {
         val preferences = sharedPref ?: return
-        if (!isHomeCategoryEnabled(preferences, StreamCenterCatalogs.CATEGORY_KEY)) return
-        StreamCenterCatalogs.configuredCatalogs(preferences).forEach { catalog ->
-            if (registeredCatalogKeys.add(catalog.key)) {
-                registerMainAPI(StreamCenter(preferences, catalogDefinition = catalog))
+        synchronized(registeredCatalogs) {
+            val configured = StreamCenterCatalogs.configuredCatalogs(preferences)
+            val configuredKeys = configured.mapTo(mutableSetOf()) { it.key }
+            registeredCatalogs.keys.filterNot { it in configuredKeys }.forEach { key ->
+                registeredCatalogs.remove(key)?.let(::unregisterCatalogApi)
+            }
+            if (!isHomeCategoryEnabled(preferences, StreamCenterCatalogs.CATEGORY_KEY)) return
+            configured.forEach { catalog ->
+                if (catalog.key !in registeredCatalogs) {
+                    val api = StreamCenter(preferences, catalogDefinition = catalog)
+                    registeredCatalogs[catalog.key] = api
+                    registerMainAPI(api)
+                }
             }
         }
+    }
+
+    private fun unregisterCatalogApi(api: StreamCenter) {
+        runCatching { APIHolder.removePluginMapping(api) }
+        runCatching { APIHolder.allProviders.remove(api) }
+        StreamCenterLogger.logMenu(
+            action = "Catalogo rimosso dai provider di CloudStream",
+            metadata = mapOf("catalogo" to api.name),
+        )
     }
 
     override fun load(context: Context) {
         sharedPref = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         activeSharedPref = sharedPref
         activeContext = context.applicationContext
+        context.getSharedPreferences("StreamCenterPersonalRadar", Context.MODE_PRIVATE).edit().clear().apply()
+        sharedPref?.let { prefs ->
+            val retired = "tv_personal_radar"
+            val storedOrder = prefs.getString(PREF_HOME_ORDER, null)
+            prefs.edit().apply {
+                prefs.all.keys.filter { it.startsWith("home_${retired}_") }.forEach { remove(it) }
+                if (storedOrder?.split(',')?.any { it.trim() == retired } == true) {
+                    putString(PREF_HOME_ORDER, storedOrder.split(',').filterNot { it.trim() == retired }.joinToString(","))
+                }
+            }.apply()
+        }
         StreamCenterHomeCalendarCache.initialize(context.filesDir, isHomeCalendarCacheEnabled(sharedPref))
+        StreamCenterHomeReuse.install(sharedPref)
+        StreamCenterUnairedResume.install(context.applicationContext)
         activePlugin = this
         StreamCenterLogger.startSession(
             context = context,
@@ -2058,6 +2164,15 @@ class StreamCenterPlugin : Plugin() {
         }
 
         it.dogior.hadEnough.localsync.StreamCenterLocalSyncAutoRunner.attach(context.applicationContext)
+        it.dogior.hadEnough.settings.StreamCenterBundledLogos.install(filename)
+        it.dogior.hadEnough.subtitles.StreamCenterAssSubtitles.install(context, filename) {
+            isLibassSubtitlesEnabled(sharedPref)
+        }
+        it.dogior.hadEnough.playback.StreamCenterPlaybackInsights.install(context) {
+            isOneTapPlaybackEnabled(sharedPref)
+        }
+        it.dogior.hadEnough.remote.StreamCenterRemote.install(context)
+        it.dogior.hadEnough.playback.StreamCenterVpnBadge.install(context)
 
         registerMainAPI(StreamCenter(sharedPref))
         registerMainAPI(StreamCenter(sharedPref, StreamCenter.SEARCH_SECTION_MOVIES))
@@ -2069,6 +2184,8 @@ class StreamCenterPlugin : Plugin() {
         if (StreamCenterMediaCache.isEnabled(sharedPref)) {
             Thread { runCatching { StreamCenterMediaCache.refreshCompletedExpiry() } }.start()
         }
+        registerVideoClickAction(it.dogior.hadEnough.remote.StreamCenterRemoteEpisodeAction())
+        registerVideoClickAction(it.dogior.hadEnough.remote.StreamCenterRemoteSourceAction())
         registerVideoClickAction(it.dogior.hadEnough.torrent.StreamCenterLibreTorrentAction())
         registerVideoClickAction(it.dogior.hadEnough.torrent.StreamCenterTorrentDetailsAction())
 
