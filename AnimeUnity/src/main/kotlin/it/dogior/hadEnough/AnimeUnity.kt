@@ -60,6 +60,10 @@ class AnimeUnity(
         @Suppress("ConstPropertyName")
         const val mainUrl = AnimeUnityPlugin.DEFAULT_SITE_URL
         const val ARCHIVE_BATCH_SIZE = 30
+
+        // Domini dei vecchi siti: un Link personalizzato non deve mai essere
+        // trattato come sito legacy solo perché non è l'host predefinito.
+        private val LEGACY_SITE_HOSTS = setOf("animeunity.co", "animeunity.to", "animeunity.so")
         const val advancedSearchSectionName = "Ricerca avanzata"
         const val latestEpisodesSectionName = "Ultimi Episodi"
         const val calendarSectionName = "Calendario"
@@ -1266,7 +1270,7 @@ class AnimeUnity(
         val shouldLabelSources = playerSources.size > 1
 
         playerSources.forEach { playerSource ->
-            check(!usesModernSite() || playerSource.url.toHttpUrl().host.removePrefix("www.") != "animeunity.co") {
+            check(!usesModernSite() || !isLegacyHost(siteHost(playerSource.url))) {
                 "AnimeUnity: episodio salvato sul vecchio sito; riaprire il titolo e selezionare nuovamente l'episodio"
             }
             val document = app.get(playerSource.url).document
@@ -1289,7 +1293,16 @@ class AnimeUnity(
         return true
     }
 
-    private fun usesModernSite() = mainUrl.toHttpUrl().host.removePrefix("www.") == "animeunity.cx"
+    private fun siteHost(url: String): String =
+        runCatching { url.toHttpUrl().host.removePrefix("www.") }.getOrDefault("")
+
+    private fun currentHost(): String = siteHost(mainUrl)
+
+    private fun isLegacyHost(host: String): Boolean = host.isNotEmpty() && host in LEGACY_SITE_HOSTS
+
+    // Il Link configurabile resta utilizzabile su Home, ricerca e schede: il sito
+    // moderno è tutto ciò che non è un vecchio dominio noto.
+    private fun usesModernSite(): Boolean = !isLegacyHost(currentHost())
 
     private fun modernProps(document: org.jsoup.nodes.Document): JSONObject {
         val data = document.selectFirst("[data-page]")?.attr("data-page")
@@ -1436,7 +1449,9 @@ class AnimeUnity(
     private suspend fun modernLoad(url: String): LoadResponse {
         val inputUrl = url.toHttpUrl()
         val requestedLanguage = inputUrl.queryParameter("language")
-        val legacyHost = inputUrl.host.removePrefix("www.") == "animeunity.co"
+        // Qualunque link salvato con un dominio diverso da quello attuale viene
+        // riallineato al Link configurato, risolvendo lo slug sul dominio in uso.
+        val legacyHost = inputUrl.host.removePrefix("www.") != currentHost()
         val path = if (legacyHost) {
             val slug = inputUrl.pathSegments.getOrNull(1)?.substringAfter('-')
                 ?: error("AnimeUnity: collegamento salvato non valido")
